@@ -1,0 +1,13 @@
+spring:
+  application:
+    name: backend-api
+
+  datasource:
+    driver-class-name: org.postgresql.Driver
+    url: jdbc:postgresql://localhost:5432/postgres
+    username: postgres
+    hikari:
+      password: 1111
+grpc:
+  server:
+    port: 9898

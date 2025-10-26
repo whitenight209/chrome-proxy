@@ -1,0 +1,21 @@
+syntax = "proto3";
+
+package trace;
+
+option java_package = "dev.chpark.backendapi.gprc";
+option java_multiple_files = true;
+
+message Trace {
+  string url = 1;
+  string method = 2;
+  int32 status = 3;
+  string time = 4;
+}
+
+message StreamAck {
+  int32 received = 1;
+}
+
+service TraceService {
+  rpc StreamTraces (stream Trace) returns (StreamAck);
+}
