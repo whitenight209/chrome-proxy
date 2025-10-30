@@ -6,11 +6,8 @@ import (
 	"context"
 	"crypto/tls"
 	"crypto/x509"
-	"encoding/json"
+	"encoding/base64"
 	"flag"
-	"github.com/elazarl/goproxy"
-	"github.com/patrickmn/go-cache"
-	"github.com/redis/go-redis/v9"
 	"io"
 	"io/ioutil"
 	"log"
@@ -19,99 +16,15 @@ import (
 	"os"
 	"strings"
 	"time"
+
+	"myproxy/core"
+
+	"github.com/elazarl/goproxy"
 )
 
-type RulePayload struct {
-	Host        string `json:"host"`
-	Path        string `json:"path"`
-	Action      string `json:"action"`       // "pass"|"print"|"modify"|"block"
-	ReplaceBody string `json:"replace_body"` // for modify
-	Enabled     bool   `json:"enabled"`
-}
-
-var (
-	rdb      *redis.Client
-	locCache *cache.Cache
+const (
+	maxBodySize = 1 * 1024 * 1024 // 1MB
 )
-
-// init redis & local cache
-func initPubsub(redisAddr string) {
-	rdb = redis.NewClient(&redis.Options{Addr: redisAddr})
-	locCache = cache.New(30*time.Second, 1*time.Minute)
-	// start subscriber
-	go startSubscriber(context.Background())
-}
-
-func startSubscriber(ctx context.Context) {
-	pubsub := rdb.Subscribe(ctx, "proxy:rule_update")
-	ch := pubsub.Channel()
-	log.Println("Subscribed to proxy:rule_update")
-	for {
-		select {
-		case <-ctx.Done():
-			_ = pubsub.Close()
-			return
-		case msg := <-ch:
-			key := msg.Payload // e.g. "proxy:rule:www.korail.com|/dynaPath.do"
-			// load value
-			val, err := rdb.Get(ctx, key).Result()
-			if err != nil {
-				// missing -> invalidate local cache
-				parts := strings.SplitN(strings.TrimPrefix(key, "proxy:rule:"), "|", 2)
-				if len(parts) == 2 {
-					locCache.Delete(parts[0] + "|" + parts[1])
-				}
-				continue
-			}
-			var r RulePayload
-			if err := json.Unmarshal([]byte(val), &r); err != nil {
-				log.Printf("bad rule json %s: %v", key, err)
-				continue
-			}
-			locCache.Set(r.Host+"|"+r.Path, &r, cache.DefaultExpiration)
-			log.Printf("cached rule %s|%s -> %s", r.Host, r.Path, r.Action)
-		}
-	}
-}
-
-// lookup: local cache first, then redis
-func lookupRule(ctx context.Context, host, path string) (*RulePayload, error) {
-	key := host + "|" + path
-	if v, ok := locCache.Get(key); ok {
-		if r, ok2 := v.(*RulePayload); ok2 {
-			return r, nil
-		}
-	}
-	redisKey := "proxy:rule:" + key
-	val, err := rdb.Get(ctx, redisKey).Result()
-	if err != nil {
-		return nil, nil // no rule
-	}
-	var r RulePayload
-	if err := json.Unmarshal([]byte(val), &r); err != nil {
-		return nil, err
-	}
-	locCache.Set(key, &r, cache.DefaultExpiration)
-	return &r, nil
-}
-
-const MaxBytesCapture = 5 * 1024 * 1024
-
-type captureWriter struct {
-	buf []byte
-	max int
-}
-
-func (w *captureWriter) Write(p []byte) (int, error) {
-	if len(w.buf) < w.max {
-		n := w.max - len(w.buf)
-		if len(p) < n {
-			n = len(p)
-		}
-		w.buf = append(w.buf, p[:n]...)
-	}
-	return len(p), nil
-}
 
 // loadTLSCert loads PEM cert+key and returns tls.Certificate and parsed x509.Certificate (root)
 func loadTLSCert(certPath, keyPath string) (tls.Certificate, *x509.Certificate, error) {
@@ -181,64 +94,173 @@ func initDB(ctx context.Context, dsn string) (*db.Store, error) {
 	return store, nil
 }
 
+// --- Body 처리 (gzip 해제 + base64 + 압축/트렁케이션) ---
+func captureBody(body io.ReadCloser, encoding, contentType string) []byte {
+	if body == nil {
+		return nil
+	}
+	defer body.Close()
+
+	// 이미지나 바이너리류는 스킵
+	if skipContent(contentType) {
+		return []byte("[SKIPPED_BINARY_CONTENT]")
+	}
+
+	// gzip 해제
+	var reader io.Reader = body
+	if strings.Contains(encoding, "gzip") {
+		gzReader, err := gzip.NewReader(body)
+		if err == nil {
+			defer gzReader.Close()
+			reader = gzReader
+		}
+	}
+
+	// 1MB까지만 읽기
+	limited := io.LimitReader(reader, maxBodySize+1)
+	data, err := io.ReadAll(limited)
+	if err != nil && err != io.EOF {
+		log.Printf("⚠️ Failed to read body: %v", err)
+	}
+
+	// 1MB 초과 시 압축 저장 + 표시
+	if len(data) > maxBodySize {
+		var buf bytes.Buffer
+		gz := gzip.NewWriter(&buf)
+		_, _ = gz.Write(data)
+		gz.Close()
+		compressed := base64.StdEncoding.EncodeToString(buf.Bytes())
+		return []byte("[TRUNCATED & COMPRESSED]:" + compressed)
+	}
+
+	// Base64 인코딩
+	return []byte(base64.StdEncoding.EncodeToString(data))
+}
+
+// --- 특정 content-type 스킵 여부 ---
+func skipContent(ct string) bool {
+	ct = strings.ToLower(ct)
+	skipTypes := []string{
+		"image/", "video/", "audio/", "font/",
+		"application/octet-stream",
+	}
+	for _, s := range skipTypes {
+		if strings.HasPrefix(ct, s) {
+			return true
+		}
+	}
+	return false
+}
+
+// --- HTTP 메서드별 Body 허용 ---
+func hasBodyMethod(method string) bool {
+	switch method {
+	case http.MethodPost, http.MethodPut, http.MethodPatch, http.MethodDelete:
+		return true
+	default:
+		return false
+	}
+}
+
+// --- Header 복제 ---
+func cloneHeader(src http.Header) map[string][]string {
+	dst := make(map[string][]string)
+	for k, v := range src {
+		dst[k] = append([]string(nil), v...)
+	}
+	return dst
+}
+func processBody(data []byte, encoding, contentType string) []byte {
+	if skipContent(contentType) {
+		return []byte("[SKIPPED_BINARY_CONTENT]")
+	}
+
+	// gzip 해제
+	if strings.Contains(encoding, "gzip") {
+		gr, err := gzip.NewReader(bytes.NewReader(data))
+		if err == nil {
+			defer gr.Close()
+			decompressed, _ := io.ReadAll(gr)
+			data = decompressed
+		}
+	}
+
+	// 1MB 초과 시 압축+인코딩
+	if len(data) > maxBodySize {
+		var buf bytes.Buffer
+		gz := gzip.NewWriter(&buf)
+		_, _ = gz.Write(data)
+		gz.Close()
+		return []byte("[TRUNCATED & COMPRESSED]:" + base64.StdEncoding.EncodeToString(buf.Bytes()))
+	}
+
+	// base64 인코딩
+	return []byte(base64.StdEncoding.EncodeToString(data))
+}
+
+// --- 메인 프록시 핸들러 ---
 func handleRequest(req *http.Request, ctx *goproxy.ProxyCtx, store *db.Store) (*http.Request, *http.Response) {
 	start := time.Now()
 
-	var reqBody []byte
-	if req.Body != nil {
-		contentType := req.Header.Get("Content-Type")
+	// --- Request Body 수집 + 복원 ---
+	var reqBodyCopy []byte
+	if req.Body != nil && hasBodyMethod(req.Method) {
 		body, err := io.ReadAll(req.Body)
 		if err != nil && err != io.EOF {
 			log.Printf("⚠️ Failed to read request body: %v", err)
 		}
-		req.Body = io.NopCloser(bytes.NewBuffer(body)) // restore body for forwarding
-		if strings.Contains(contentType, "application/json") {
-			reqBody = body
-		}
+		req.Body.Close()
+		req.Body = io.NopCloser(bytes.NewBuffer(body)) // 복원 (필수)
+		reqBodyCopy = processBody(body, req.Header.Get("Content-Encoding"), req.Header.Get("Content-Type"))
 	}
 
-	// Forward the request normally
+	reqHeaders := cloneHeader(req.Header)
+	reqCT := req.Header.Get("Content-Type")
+
+	// --- 요청 전달 ---
 	resp, err := http.DefaultTransport.RoundTrip(req)
 	if err != nil {
 		log.Printf("❌ Error forwarding request: %v", err)
 		return req, goproxy.NewResponse(req, goproxy.ContentTypeText, http.StatusBadGateway, err.Error())
 	}
 
-	var respBody []byte
+	// --- Response Body 수집 + 복원 ---
+	var respBodyCopy []byte
 	if resp.Body != nil {
-		contentType := resp.Header.Get("Content-Type")
 		body, err := io.ReadAll(resp.Body)
 		if err != nil && err != io.EOF {
-			log.Printf("⚠️ Failed to read request body: %v", err)
+			log.Printf("⚠️ Failed to read response body: %v", err)
 		}
-		resp.Body = io.NopCloser(bytes.NewBuffer(body)) // restore body for client
-		if strings.Contains(contentType, "application/json") {
-			respBody = body
-		}
+		resp.Body.Close()
+		resp.Body = io.NopCloser(bytes.NewBuffer(body)) // 복원 (Chrome 응답 위해 필수)
+		respBodyCopy = processBody(body, resp.Header.Get("Content-Encoding"), resp.Header.Get("Content-Type"))
 	}
 
+	respHeaders := cloneHeader(resp.Header)
+	respCT := resp.Header.Get("Content-Type")
 	duration := time.Since(start).Milliseconds()
 
-	if store != nil {
+	// --- 비동기 DB 로깅 ---
+	if store != nil && core.LogQueue != nil {
 		entry := db.ProxyLog{
-			ClientIP:       req.RemoteAddr,
-			Method:         req.Method,
-			URL:            req.URL.String(),
-			StatusCode:     resp.StatusCode,
-			ResponseTimeMs: int(duration),
-			RequestBody:    string(reqBody),
-			ResponseBody:   string(respBody),
+			ClientIP:            req.RemoteAddr,
+			Method:              req.Method,
+			URL:                 req.URL.String(),
+			StatusCode:          resp.StatusCode,
+			ResponseTimeMs:      int(duration),
+			RequestBody:         reqBodyCopy,
+			ResponseBody:        respBodyCopy,
+			RequestContentType:  reqCT,
+			ResponseContentType: respCT,
+			RequestHeaders:      reqHeaders,
+			ResponseHeaders:     respHeaders,
 		}
 
-		// ✅ Run async: don’t block proxy response
-		go func(e db.ProxyLog) {
-			ctxTimeout, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-			defer cancel()
-
-			if err := store.StoreProxyLog(ctxTimeout, e); err != nil {
-				log.Printf("❌ DB insert failed: %v", err)
-			}
-		}(entry)
+		select {
+		case core.LogQueue <- entry:
+		default:
+			log.Printf("⚠️ Log queue full — dropping entry for %s", req.URL.String())
+		}
 	}
 
 	return req, resp
@@ -247,8 +269,9 @@ func handleRequest(req *http.Request, ctx *goproxy.ProxyCtx, store *db.Store) (*
 func main() {
 	certPath := "ca-cert.pem"
 	keyPath := "ca-key.pem"
+	grpcAddr := "127.0.0.1:9898"
 	enableDB := flag.Bool("db", false, "Enable PostgreSQL connection")
-	dsn := flag.String("dsn", "postgres://user:password@localhost:5432/mydb?sslmode=disable", "PostgreSQL DSN")
+	dsn := flag.String("dsn", "postgres://postgres:qkrcjfgh1@localhost:5432/playground?sslmode=disable", "PostgreSQL DSN")
 	flag.Parse()
 	ctx := context.Background()
 	var store *db.Store
@@ -257,6 +280,10 @@ func main() {
 		store, err = initDB(ctx, *dsn)
 		if err != nil {
 			log.Fatalf("❌ Failed to initialize DB: %v", err)
+		}
+		err := core.InitLogWorkers(store, grpcAddr)
+		if err != nil {
+			log.Fatalf("❌ Failed to InitLogWorkers: %v", err)
 		}
 		defer store.Close()
 	} else {
@@ -275,10 +302,8 @@ func main() {
 
 	// (선택) 로그로 확인
 	log.Printf("Loaded CA for goproxy: Subject=%s\n", rootCert.Subject.CommonName)
-	log.Printf("start connect to redis...")
-	initPubsub("127.0.0.1:6379")
 	proxy := goproxy.NewProxyHttpServer()
-	proxy.Verbose = true
+	proxy.Verbose = false
 
 	// Enable MITM for CONNECT (goproxy will sign per-host certs using GoproxyCa)
 	// Use the predefined handler AlwaysMitm (do MITM). We don't register any DoFunc/ModifyResponse,

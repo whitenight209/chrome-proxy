@@ -73,7 +73,8 @@ dependencies {
 	implementation("io.grpc:grpc-stub")
 	implementation("io.grpc:grpc-protobuf")
 	implementation("javax.annotation:javax.annotation-api:1.3.2")
-
+    implementation("org.springframework.boot:spring-boot-starter-websocket")
+    implementation("com.fasterxml.jackson.core:jackson-databind")
 }
 
 hibernate {

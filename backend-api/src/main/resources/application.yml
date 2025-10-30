@@ -1,13 +1,19 @@
+server:
+  port: 8081
+
 spring:
   application:
     name: backend-api
-
   datasource:
     driver-class-name: org.postgresql.Driver
-    url: jdbc:postgresql://localhost:5432/postgres
+    url: jdbc:postgresql://localhost:5432/playground
     username: postgres
-    hikari:
-      password: 1111
+    password: qkrcjfgh1
+
+  web:
+    resources:
+      add-mappings: false
+
 grpc:
   server:
     port: 9898

@@ -2,18 +2,25 @@ package db
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"log"
+
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 type ProxyLog struct {
-	ClientIP       string
-	Method         string
-	URL            string
-	StatusCode     int
-	ResponseTimeMs int
-	RequestBody    string
-	ResponseBody   string
+	ClientIP            string
+	Method              string
+	URL                 string
+	StatusCode          int
+	ResponseTimeMs      int
+	RequestBody         []byte
+	ResponseBody        []byte
+	RequestContentType  string
+	ResponseContentType string
+	RequestHeaders      map[string][]string
+	ResponseHeaders     map[string][]string
 }
 
 type Store struct {
@@ -34,13 +41,48 @@ func (s *Store) Close() {
 	s.Pool.Close()
 }
 
-// StoreProxyLog inserts a single proxy log into the database
-func (s *Store) StoreProxyLog(ctx context.Context, entry ProxyLog) error {
+func (s *Store) StoreProxyLog(ctx context.Context, entry ProxyLog) (string, error) {
 	query := `
-        INSERT INTO proxy_logs (client_ip, method, url, status_code, response_time_ms, request_body, response_body)
-        VALUES ($1, $2, $3, $4, $5, $6, $7)
+        INSERT INTO proxy_logs (
+            client_ip,
+            method,
+            url,
+            status_code,
+            response_time_ms,
+            request_body,
+            response_body,
+            request_content_type,
+            response_content_type,
+            request_headers,
+            response_headers
+        )
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+        RETURNING id
     `
-	_, err := s.Pool.Exec(ctx, query,
+	reqHdrJSON, err1 := json.Marshal(entry.RequestHeaders)
+	if err1 != nil {
+		log.Printf("❌ Failed to marshal request headers: %v", err1)
+	}
+	respHdrJSON, err2 := json.Marshal(entry.ResponseHeaders)
+	if err2 != nil {
+		log.Printf("❌ Failed to marshal response headers: %v", err2)
+	}
+	//log.Printf("📥 Inserting ProxyLog:\n"+
+	//	"ClientIP=%s\nMethod=%s\nURL=%s\nStatus=%d\nTime=%dms\n"+
+	//	"RequestContentType=%s\nResponseContentType=%s\n"+
+	//	"RequestHeaders=%s\nResponseHeaders=%s\n",
+	//	entry.ClientIP,
+	//	entry.Method,
+	//	entry.URL,
+	//	entry.StatusCode,
+	//	entry.ResponseTimeMs,
+	//	entry.RequestContentType,
+	//	entry.ResponseContentType,
+	//	string(reqHdrJSON),
+	//	string(respHdrJSON),
+	//)
+	var id string
+	err := s.Pool.QueryRow(ctx, query,
 		entry.ClientIP,
 		entry.Method,
 		entry.URL,
@@ -48,6 +90,14 @@ func (s *Store) StoreProxyLog(ctx context.Context, entry ProxyLog) error {
 		entry.ResponseTimeMs,
 		entry.RequestBody,
 		entry.ResponseBody,
-	)
-	return err
+		entry.RequestContentType,
+		entry.ResponseContentType,
+		reqHdrJSON,  // map → JSONB 자동 변환 (pgx 지원)
+		respHdrJSON, // map → JSONB 자동 변환
+	).Scan(&id)
+
+	if err != nil {
+		return "", err
+	}
+	return id, nil
 }
